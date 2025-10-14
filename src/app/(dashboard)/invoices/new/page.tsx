@@ -1,10 +1,11 @@
 'use client'
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
 import CustomTextField from '@core/components/mui/TextField'
 import { MenuItem, Button, Grid, Card, CardContent, Typography, Divider } from '@mui/material'
 import { z } from 'zod'
 import { CreateInvoiceInput } from '@/types/invoice'
+import { CreateInvoiceResponse, InvoiceFormState } from '@/types/invoice-ui'
 import api from '@/utils/api'
 
 const schema = z.object({
@@ -16,18 +17,38 @@ const schema = z.object({
   description: z.string().optional()
 })
 
-type FormState = {
-  data: Partial<CreateInvoiceInput>
-  errors: Record<string, string>
-  submitting: boolean
-  success?: boolean
-  syncMessage?: string
-  syncError?: string
+
+// Helper to parse an unknown error into user + field errors.
+function parseApiError(err: unknown): { formError: string; fieldErrors?: Record<string, string> } {
+  
+  // Attempt to recognize our server 400 validation shape: { errors: { fieldErrors, formErrors } }
+  if (typeof err === 'object' && err && 'response' in (err as any)) {
+    const axiosErr = err as any
+    const status = axiosErr?.response?.status
+    const data = axiosErr?.response?.data
+    if (status === 400 && data?.errors?.fieldErrors) {
+      const serverFieldErrors = data.errors.fieldErrors as Record<string, string[]>
+      const mapped: Record<string, string> = {}
+      for (const k of Object.keys(serverFieldErrors)) {
+        const arr = serverFieldErrors[k]
+        if (Array.isArray(arr) && arr.length) mapped[k] = arr[0]
+      }
+      return { formError: 'Validation failed', fieldErrors: mapped }
+    }
+    if (status && data?.error) {
+      return { formError: data.error }
+    }
+  }
+  if (err instanceof Error) {
+    return { formError: err.message || 'Unexpected error' }
+  }
+  return { formError: 'Unknown error' }
 }
 
 export default function NewInvoicePage() {
-  const [state, setState] = useState<FormState>({ data: { status: 'DRAFT' }, errors: {}, submitting: false })
+  const [state, setState] = useState<InvoiceFormState>({ data: { status: 'DRAFT' }, errors: {}, status: 'idle' })
   const [realmId, setRealmId] = useState<string | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   // Load realmId from localStorage (set after QuickBooks OAuth callback via button component)
   useEffect(() => {
@@ -37,15 +58,19 @@ export default function NewInvoicePage() {
     }
   }, [])
 
-  function setField<K extends keyof CreateInvoiceInput>(key: K, value: any) {
-    setState(s => ({ ...s, data: { ...s.data, [key]: value } }))
+  function setField<K extends keyof CreateInvoiceInput>(key: K, value: CreateInvoiceInput[K]) {
+    // Clear only that field's error when user edits it.
+    setState(s => {
+      const { [key]: _removed, ...rest } = s.errors
+      return { ...s, data: { ...s.data, [key]: value }, errors: rest }
+    })
   }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
-    setState(s => ({ ...s, submitting: true, errors: {}, success: false, syncMessage: undefined, syncError: undefined }))
+    setState(s => ({ ...s, status: 'validating', errors: {}, syncMessage: undefined, syncError: undefined }))
 
-  const parsed = schema.safeParse(state.data)
+    const parsed = schema.safeParse(state.data)
     if (!parsed.success) {
       const fieldErrors: Record<string, string> = {}
       const flat = parsed.error.flatten().fieldErrors as Record<string, string[] | undefined>
@@ -53,9 +78,16 @@ export default function NewInvoicePage() {
         const arr = flat[k]
         if (arr && arr.length) fieldErrors[k] = arr[0]
       }
-      setState(s => ({ ...s, submitting: false, errors: fieldErrors }))
+      setState(s => ({ ...s, status: 'error', errors: fieldErrors }))
       return
     }
+
+    // Abort any prior in‑flight request
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    setState(s => ({ ...s, status: 'submitting' }))
 
     try {
       const body: CreateInvoiceInput & { realmId?: string } = {
@@ -67,28 +99,28 @@ export default function NewInvoicePage() {
         dueDate: parsed.data.dueDate,
         realmId: realmId || undefined
       }
-      const response: any = await api.post('/api/invoices', body)
-      const sync = response?.sync
-      let syncMessage: string | undefined
-      let syncError: string | undefined
-      if (sync) {
-        if (sync.success && sync.quickbooksId) syncMessage = `QuickBooks synced (ID ${sync.quickbooksId})`
-        else if (!sync.success && sync.error) syncError = `QuickBooks sync failed: ${sync.error}`
-      } else if (realmId) {
-        // If we expected sync (realmId present) but got no sync object, note it
-        syncError = 'QuickBooks sync did not return a result.'
-      }
+      const response = await api.post<CreateInvoiceResponse>('/api/invoices', body)
+      const sync = response.sync || undefined
+      const syncMessage = sync && sync.success && sync.quickbooksId ? `QuickBooks synced (ID ${sync.quickbooksId})` : undefined
+      const syncError = sync && !sync.success ? (sync.error ? `QuickBooks sync failed: ${sync.error}` : 'QuickBooks sync failed.') : (!sync && realmId ? 'QuickBooks sync result missing' : undefined)
+
       setState(s => ({
         ...s,
-        submitting: false,
-        success: true,
+        status: 'success',
         data: { status: s.data.status || 'DRAFT' },
         errors: {},
         syncMessage,
         syncError
       }))
-    } catch (err: any) {
-      setState(s => ({ ...s, submitting: false, errors: { form: err.message } }))
+    } catch (err) {
+      if ((err as any)?.name === 'AbortError') return
+      console.error('Create invoice failed', err)
+      const { formError, fieldErrors } = parseApiError(err)
+      setState(s => ({
+        ...s,
+        status: 'error',
+        errors: { ...(fieldErrors || {}), form: formError }
+      }))
     }
   }
 
@@ -147,7 +179,12 @@ export default function NewInvoicePage() {
                     label='Amount'
                     placeholder='0.00'
                     value={state.data.amount as any || ''}
-                    onChange={e => setField('amount', e.target.value)}
+                    onChange={e => {
+                      const raw = e.target.value
+                      // Keep as number if valid, else NaN will be caught by validation later
+                      const num = raw === '' ? (undefined as unknown as number) : Number(raw)
+                      setField('amount', num as unknown as number)
+                    }}
                     error={!!state.errors.amount}
                     helperText={state.errors.amount}
                   />
@@ -158,7 +195,7 @@ export default function NewInvoicePage() {
                     fullWidth
                     label='Status'
                     value={state.data.status}
-                    onChange={e => setField('status', e.target.value)}
+                    onChange={e => setField('status', e.target.value as 'DRAFT' | 'PAID')}
                   >
                     <MenuItem value='DRAFT'>Draft</MenuItem>
                     <MenuItem value='PAID'>Paid</MenuItem>
@@ -181,26 +218,26 @@ export default function NewInvoicePage() {
                 <Button
                   variant='outlined'
                   size='small'
-                  disabled={state.submitting}
-                  onClick={() => setState(s => ({ ...s, data: { status: s.data.status || 'DRAFT' }, errors: {}, success: false }))}
+                  disabled={state.status === 'submitting'}
+                  onClick={() => setState(s => ({ ...s, data: { status: s.data.status || 'DRAFT' }, errors: {}, status: 'idle', syncMessage: undefined, syncError: undefined }))}
                 >
                   Reset
                 </Button>
                 <Button
                   variant='contained'
                   size='small'
-                  disabled={state.submitting}
+                  disabled={state.status === 'submitting'}
                   type='submit'
                 >
-                  {state.submitting ? 'Saving…' : 'Save Invoice'}
+                  {state.status === 'submitting' ? (realmId ? 'Saving & Syncing…' : 'Saving…') : 'Save Invoice'}
                 </Button>
               </div>
               <div className='space-y-1'>
-                {state.errors.form && <Typography variant='body2' color='error.main'>{state.errors.form}</Typography>}
-                {state.success && !state.errors.form && <Typography variant='body2' color='success.main'>Invoice created successfully.</Typography>}
+                {state.errors.form && state.status === 'error' && <Typography variant='body2' color='error.main'>{state.errors.form}</Typography>}
+                {state.status === 'success' && !state.errors.form && <Typography variant='body2' color='success.main'>Invoice created successfully.</Typography>}
                 {state.syncMessage && <Typography variant='body2' color='success.main'>{state.syncMessage}</Typography>}
                 {state.syncError && <Typography variant='body2' color='warning.main'>{state.syncError}</Typography>}
-                {realmId && !state.syncMessage && !state.syncError && state.success && (
+                {realmId && !state.syncMessage && !state.syncError && state.status === 'success' && (
                   <Typography variant='caption' color='text.secondary'>Sync pending...</Typography>
                 )}
               </div>

@@ -1,6 +1,6 @@
 'use client'
 import React from 'react'
-import { Invoice } from '@/types/invoice'
+import { ClientInvoicesTableProps } from '@/types/invoice-ui'
 import Link from 'next/link'
 import dynamic from 'next/dynamic'
 import { Card, CardContent, Typography, Button, MenuItem } from '@mui/material'
@@ -12,7 +12,7 @@ import classnames from 'classnames'
 // client-only QuickBooks connect button
 const QuickBooksConnectButton = dynamic(() => import('@/components/quickbooks/QuickBooksConnectButton'), { ssr: false })
 
-export default function ClientInvoicesTable({ initialInvoices, error }: { initialInvoices: Invoice[]; error: string | null }) {
+export default function ClientInvoicesTable({ initialInvoices, error }: ClientInvoicesTableProps) {
   const [page, setPage] = React.useState(0)
   const [rowsPerPage, setRowsPerPage] = React.useState(10)
   const [query, setQuery] = React.useState('')
